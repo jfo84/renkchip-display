@@ -48,7 +48,7 @@ All research was done on hardware I own, on my own network.
 | --- | --- |
 | `src/bump.c` | On-device lab program: live cast tap → H.264 decode → VPU buffer → win0 scanout, plus VOP MMU and memory-forensics modes |
 | `src/demux.c`, `src/demux.h` | The cast-tap parse path (RTP → TS → PES → H.264 AUs), extracted so it builds and tests on a host |
-| `tests/test_demux.c` | Demuxer tests: synthetic TS/PES/RTP vectors built in C, no captured data |
+| `tests/test_demux.c` | Demuxer tests: synthetic TS/PES/RTP vectors built in C, no captured data, plus a deterministic mutation fuzzer (`--fuzz`) |
 | `scripts/` | Host-side C2: arm, re-arm after reboot, remote shell, build |
 | `scripts/ops_dlna.sh` | The TV status driver: render → serve → SOAP-play loop |
 | `scripts/serve_ops.ps1`, `scripts/setup_ops.ps1` | Desktop file server + one-shot setup |
