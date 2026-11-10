@@ -25,8 +25,12 @@ All research was done on hardware I own, on my own network.
 - Hardware decode proven: 128/128 frames through `libvpu` (legacy API).
 - Direct display-controller programming proven: win0 scanout of my own buffer
   renders a YUV test pattern on the panel, hardware-scaled 720p → 1080p.
-- Open: VOP IOMMU page faults (red squares on the test pattern), and an
-  intermittent decoder "empty frames" mode. See `docs/FINDINGS.md`.
+  VOP IOMMU fetch faults (red squares) fixed by MMU bypass (`mmuoff`).
+- **Full live path proven (Nov 6)**: a real cast's RTP tapped off the air
+  (AF_PACKET), demuxed to H.264, decoded, scanned out on win0 — 300+ frames
+  of live 720p through the whole own pipeline (`bump x live`).
+- Open: 1080p via EDID/CEA negotiation; the boot-to-boot pagemap garbage
+  behind the green screen (see `docs/FINDINGS.md`).
 
 ## Layout
 
