@@ -18,6 +18,7 @@
 #include <linux/fb.h>
 
 #include "vpu_api.h"
+#include "demux.h"
 
 #define ALIGN16(v) (((v) + 15) & ~15)
 
@@ -88,16 +89,6 @@ static void blit_nv12(int fd, const unsigned char *frame, int src_w, int src_h,
 }
 
 /* next AU boundary: start code before a slice NAL (type 1 or 5) */
-static long next_au(const unsigned char *p, long size, long from)
-{
-    for (long i = from; i + 5 < size; i++) {
-        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1 &&
-            ((p[i + 3] & 0x1F) == 1 || (p[i + 3] & 0x1F) == 5))
-            return i;
-    }
-    return -1;
-}
-
 static double now_ms(void)
 {
     struct timespec ts;
@@ -253,6 +244,61 @@ static int win0_program(unsigned int y_bus, unsigned int uv_bus, unsigned int vi
     munmap(lcdc, 4096);
     close(mfd);
     return 0;
+}
+
+/* live-mode shared state: dx carries the wire state and vitals, live
+ * carries what live_au needs to feed the decoder and program win0. */
+static struct demux dx;
+static struct {
+    VpuCodecContext_t *ctx;
+    unsigned char *tm;             /* /dev/mem alias of the win0 target */
+    unsigned int tgt_phy;
+    int win0_done;
+    long frames;
+    int last_sr;
+    unsigned last_fw, last_fh;
+    double t_feed;
+} live;
+
+/* One complete H.264 access unit from the demux: feed the decoder, drain
+ * up to 4 frames; the first sane frame programs win0, every frame blits. */
+static void live_au(void *unused, const unsigned char *au, long len)
+{
+    (void)unused;
+    VideoPacket_t vp;
+    VPU_FRAME vframe;
+    DecoderOut_t out;
+    memset(&vp, 0, sizeof vp);
+    vp.data = (unsigned char *)au;
+    vp.size = len;
+    live.last_sr = live.ctx->decode_sendstream(live.ctx, &vp);
+    live.t_feed = now_ms();
+    for (int k = 0; k < 4; k++) {              /* drain */
+        memset(&vframe, 0, sizeof vframe);
+        memset(&out, 0, sizeof out);
+        out.data = (unsigned char *)&vframe;
+        live.ctx->decode_getframe(live.ctx, &out);
+        if (out.size == 0 || !vframe.vpumem.vir_addr)
+            break;
+        unsigned int hs = vframe.FrameWidth;
+        unsigned int vs = vframe.FrameHeight;
+        live.last_fw = hs; live.last_fh = vs;
+        if (hs && vs && hs <= 1280 && vs <= 720) {
+            if (!live.win0_done) {
+                win0_program(live.tgt_phy - 0x50000000,
+                             live.tgt_phy - 0x50000000 + hs * vs, hs);
+                live.win0_done = 1;
+                fprintf(stderr, "live: win0 y=%08x fw=%u fh=%u\n",
+                        live.tgt_phy - 0x50000000, hs, vs);
+            }
+            memcpy(live.tm, vframe.vpumem.vir_addr, hs * vs * 3 / 2);
+        }
+        VPUFreeLinear(&vframe.vpumem);
+        live.frames++;
+        if ((live.frames & 31) == 0)
+            fprintf(stderr, "live: f%ld rtp=%u lost=%u pes=%ld\n",
+                    live.frames, dx.rtp_cnt, dx.rtp_lost, dx.pes_cnt);
+    }
 }
 
 int main(int argc, char **argv)
@@ -442,7 +488,7 @@ int main(int argc, char **argv)
          * has spread across the points; a pool-recycled empty one is
          * flat. Free each frame after inspecting (main-loop pattern). */
         while (poff < psz && nf < nfwant) {
-            long au = next_au(pes, psz, poff + 4);
+            long au = demux_next_au(pes, psz, poff + 4);
             long chunk = (au > 0 ? au : psz) - poff;
             VideoPacket_t pkt;
             memset(&pkt, 0, sizeof(pkt));
@@ -558,28 +604,18 @@ int main(int argc, char **argv)
                 tgt_phy);
 
         unsigned char pkt[2048];
-        unsigned char pes[256 * 1024];          /* PES under construction */
-        unsigned int peslen = 0, pescap = sizeof pes;
-        static unsigned char es[4 * 1024 * 1024]; /* unsplit AU window */
-        unsigned int esr = 0, esw = 0;
-        int vpid = -1, pmt_pid = -1, in_pes = 0;
-        unsigned rtp_last = 0, rtp_lost = 0, rtp_cnt = 0;
-        long pes_cnt = 0, frames = 0;
-        int win0_done = 0;
-        double t_last = now_ms();
-        double t_feed = now_ms(), t_stat = now_ms();
-        unsigned last_fw = 0, last_fh = 0;
-        int last_sr = 0;
-        VPU_FRAME vframe;
-        DecoderOut_t out;
-        VideoPacket_t vp;
+        dx.pmt_pid = dx.vpid = dx.apid = -1;    /* pids found on the wire */
+        double t_last = now_ms(), t_stat = now_ms();
+        live.ctx = ctx; live.tm = tm; live.tgt_phy = tgt_phy;
+        live.win0_done = 0; live.frames = 0; live.last_sr = 0;
+        live.last_fw = live.last_fh = 0; live.t_feed = now_ms();
 
         while (1) {
             double idle = now_ms() - t_last;
             /* 30-min no-cast patience: the human discovery+connect dance
              * (Win+K refresh, slow listing) took >5 min once and cost us
              * the session at exactly 300s. */
-            if (idle > (frames ? 10000 : 1800000)) break;
+            if (idle > (live.frames ? 10000 : 1800000)) break;
             struct timeval tv = { 0, 20000 };
             fd_set fds;
             FD_ZERO(&fds);
@@ -588,71 +624,26 @@ int main(int argc, char **argv)
                 /* sparse-stream flush: a static screen may never produce
                  * the NEXT slice start code, so next_au would never cut
                  * an AU. Time-flush the pending window to the decoder. */
-                if (esw - esr > 8 && now_ms() - t_feed > 500) {
-                    memset(&vp, 0, sizeof vp);
-                    vp.data = es + esr;
-                    vp.size = esw - esr;
-                    esr = esw;
-                    last_sr = ctx->decode_sendstream(ctx, &vp);
-                    t_feed = now_ms();
-                    for (int k = 0; k < 4; k++) {
-                        memset(&vframe, 0, sizeof vframe);
-                        memset(&out, 0, sizeof out);
-                        out.data = (unsigned char *)&vframe;
-                        ctx->decode_getframe(ctx, &out);
-                        if (out.size == 0 || !vframe.vpumem.vir_addr)
-                            break;
-                        last_fw = vframe.FrameWidth;
-                        last_fh = vframe.FrameHeight;
-                        if (last_fw && last_fh && last_fw <= 1280 &&
-                            last_fh <= 720) {
-                            if (!win0_done) {
-                                win0_program(tgt_phy - 0x50000000,
-                                             tgt_phy - 0x50000000 +
-                                                 last_fw * last_fh,
-                                             last_fw);
-                                win0_done = 1;
-                                fprintf(stderr,
-                                        "live: win0 y=%08x fw=%u fh=%u\n",
-                                        tgt_phy - 0x50000000, last_fw,
-                                        last_fh);
-                            }
-                            memcpy(tm, vframe.vpumem.vir_addr,
-                                   last_fw * last_fh * 3 / 2);
-                        }
-                        VPUFreeLinear(&vframe.vpumem);
-                        frames++;
-                    }
-                }
+                if (dx.esw - dx.esr > 8 && now_ms() - live.t_feed > 500)
+                    demux_flush(&dx, live_au, NULL);
                 /* 1Hz vitals: what the tap, PES path and decoder did */
                 if (now_ms() - t_stat > 1000) {
                     fprintf(stderr,
                             "live: rtp=%u lost=%u pes=%ld pend=%u f=%ld "
                             "sr=%d fw=%u fh=%u\n",
-                            rtp_cnt, rtp_lost, pes_cnt, esw - esr, frames,
-                            last_sr, last_fw, last_fh);
+                            dx.rtp_cnt, dx.rtp_lost, dx.pes_cnt,
+                            dx.esw - dx.esr, live.frames, live.last_sr,
+                            live.last_fw, live.last_fh);
                     t_stat = now_ms();
                 }
                 continue;
             }
             int n = recvfrom(s, pkt, sizeof pkt, 0, NULL, NULL);
-            /* eth → IP → UDP:15550 → RTP. Fall back to a 0x45 scan if
-             * the link layer isn't plain Ethernet II on this radio. */
-            unsigned char *ip = NULL;
-            if (n > 34 && pkt[12] == 0x08 && pkt[13] == 0x00) ip = pkt + 14;
-            else {
-                for (int i = 14; i < 34 && i + 20 <= n; i++)
-                    if (pkt[i] == 0x45) { ip = pkt + i; break; }
-            }
-            if (!ip || (ip[0] >> 4) != 4 || ip[9] != 17) continue;
-            int ihl = (ip[0] & 0xF) * 4;
-            unsigned char *udp = ip + ihl;
-            int dport = (udp[2] << 8) | udp[3];
-            if (dport != 15550) continue;
-            unsigned char *r = udp + 8;
-            int rn = n - (r - pkt);
-            if (rn < 12 || (r[0] >> 6) != 2) continue;
-            unsigned char *pkt_rtp = r;
+            /* eth → IP → UDP:15550 → RTP → TS → PES → AUs — the parse
+             * path lives in demux.c now (host-testable); live_au feeds
+             * the decoder and programs win0 per complete access unit. */
+            if (!demux_frame(&dx, pkt, n, 15550, live_au, NULL))
+                continue;
             t_last = now_ms();
             if (!took_display) {
                 /* First RTP: the session is live (discovery+connect+PLAY
@@ -665,140 +656,11 @@ int main(int argc, char **argv)
                 took_display = 1;
                 fprintf(stderr, "live: first RTP — took display\n");
             }
-            int hl = 12 + 4 * (pkt_rtp[0] & 0xF);
-            if (pkt_rtp[0] & 0x10) {            /* RTP extension */
-                if (hl + 4 <= rn)
-                    hl += 4 + 4 * ((pkt_rtp[hl + 2] << 8) | pkt_rtp[hl + 3]);
-            }
-            if (hl >= rn) continue;
-            unsigned seq = (pkt_rtp[2] << 8) | pkt_rtp[3];
-            if (rtp_last) {
-                unsigned d = (seq - rtp_last - 1) & 0xFFFF;
-                if (d < 0x8000) rtp_lost += d;
-            }
-            rtp_last = seq;
-            rtp_cnt++;
-            unsigned char *p = pkt_rtp + hl;
-            int plen = rn - hl;
-
-            for (int o = 0; o + 188 <= plen; o += 188) {
-                unsigned char *t = p + o;
-                if (t[0] != 0x47) continue;      /* no resync: lose the pkt */
-                int pid = ((t[1] & 0x1F) << 8) | t[2];
-                int pusi = t[1] & 0x40;
-                int afc = (t[3] >> 4) & 3;
-                int q = 4;
-                if (afc & 2) q += 1 + t[4];
-                if (!(afc & 1) || q >= 188) continue;
-                unsigned char *pl = t + q;
-                int pll = 188 - q;
-
-                if (pid == 0 && pusi && pmt_pid < 0) {
-                    unsigned char *sec = pl + 1 + pl[0];
-                    if (pl[0] <= 32 && pll >= (int)pl[0] + 14)
-                        pmt_pid = ((sec[10] << 8) | sec[11]) & 0x1FFF;
-                    fprintf(stderr, "live: PAT pmt_pid=%d\n", pmt_pid);
-                    continue;
-                }
-                if (pmt_pid > 0 && pid == pmt_pid && pusi && vpid < 0) {
-                    unsigned char *sec = pl + 1 + pl[0];
-                    if (pll <= 16) continue;
-                    int slen = ((sec[1] & 0xF) << 8) | sec[2];
-                    int pilen = ((sec[10] & 0xF) << 8) | sec[11];
-                    int pp = 12 + pilen, apid = -1;
-                    int lim = 3 + slen - 4;
-                    if (lim > pll) lim = pll;
-                    while (pp + 5 <= lim) {
-                        int st = sec[pp];
-                        int ep = ((sec[pp + 1] & 0x1F) << 8) | sec[pp + 2];
-                        int el = ((sec[pp + 3] & 0xF) << 8) | sec[pp + 4];
-                        if (st == 0x1B && vpid < 0) vpid = ep;
-                        if (st == 0x0F) apid = ep;
-                        pp += 5 + el;
-                    }
-                    fprintf(stderr, "live: PMT vpid=%d apid=%d\n", vpid, apid);
-                    continue;
-                }
-                if (pid != vpid) continue;       /* video only for now */
-
-                if (pusi && in_pes) {            /* close PES → ES tail */
-                    if (peslen > 9 && pes[0] == 0 && pes[1] == 0 &&
-                        pes[2] == 1) {
-                        unsigned int off = 9 + pes[8];
-                        if (off < peslen) {
-                            if (esw + (peslen - off) > sizeof es) {
-                                memmove(es, es + esr, esw - esr);
-                                esw -= esr;
-                                esr = 0;
-                            }
-                            if (esw + (peslen - off) <= sizeof es) {
-                                memcpy(es + esw, pes + off, peslen - off);
-                                esw += peslen - off;
-                                pes_cnt++;
-                            }
-                        }
-                    }
-                    in_pes = 0;
-                    peslen = 0;
-                    /* feed every complete AU in the window */
-                    long au;
-                    while (esw - esr > 8 &&
-                           (au = next_au(es, esw, esr + 4)) > 0) {
-                        memset(&vp, 0, sizeof vp);
-                        vp.data = es + esr;
-                        vp.size = au - esr;
-                        esr = au;
-                        last_sr = ctx->decode_sendstream(ctx, &vp);
-                        t_feed = now_ms();
-                        for (int k = 0; k < 4; k++) {   /* drain */
-                            memset(&vframe, 0, sizeof vframe);
-                            memset(&out, 0, sizeof out);
-                            out.data = (unsigned char *)&vframe;
-                            ctx->decode_getframe(ctx, &out);
-                            if (out.size == 0 || !vframe.vpumem.vir_addr)
-                                break;
-                            unsigned int hs = vframe.FrameWidth;
-                            unsigned int vs = vframe.FrameHeight;
-                            last_fw = hs; last_fh = vs;
-                            if (hs && vs && hs <= 1280 && vs <= 720) {
-                                if (!win0_done) {
-                                    win0_program(tgt_phy - 0x50000000,
-                                                 tgt_phy - 0x50000000 +
-                                                     hs * vs, hs);
-                                    win0_done = 1;
-                                    fprintf(stderr,
-                                            "live: win0 y=%08x fw=%u fh=%u\n",
-                                            tgt_phy - 0x50000000, hs, vs);
-                                }
-                                memcpy(tm, vframe.vpumem.vir_addr,
-                                       hs * vs * 3 / 2);
-                            }
-                            VPUFreeLinear(&vframe.vpumem);
-                            frames++;
-                            if ((frames & 31) == 0)
-                                fprintf(stderr,
-                                        "live: f%ld rtp=%u lost=%u pes=%ld\n",
-                                        frames, rtp_cnt, rtp_lost, pes_cnt);
-                        }
-                    }
-                }
-                if (pusi) {
-                    in_pes = 1;
-                    peslen = 0;
-                }
-                if (in_pes && peslen + pll <= pescap) {
-                    memcpy(pes + peslen, pl, pll);
-                    peslen += pll;
-                } else if (in_pes) {
-                    peslen = 0;                  /* oversize: drop PES */
-                    in_pes = 0;
-                }
-            }
         }
         fprintf(stderr, "live: end f%ld rtp=%u lost=%u pes=%ld idle-break\n",
-                frames, rtp_cnt, rtp_lost, pes_cnt);
+                live.frames, dx.rtp_cnt, dx.rtp_lost, dx.pes_cnt);
         close(s);
-        if (win0_done) {
+        if (live.win0_done) {
             /* hand the display back: boot win0 + MMU translation */
             unsigned int *sys_ctrl = (unsigned int *)(mmu + 0x00);
             unsigned int *yrgb_mst = (unsigned int *)(mmu + 0x20);
@@ -818,8 +680,8 @@ int main(int argc, char **argv)
         /* tgt is fb0's scanout region — never free */
         ctx->flush(ctx);
         vpu_close_context(&ctx);
-        printf("bump: live done frames=%ld rtp=%u lost=%u", frames,
-               rtp_cnt, rtp_lost);
+        printf("bump: live done frames=%ld rtp=%u lost=%u", live.frames,
+               dx.rtp_cnt, dx.rtp_lost);
         return 0;
     }
 
@@ -1121,7 +983,7 @@ int main(int argc, char **argv)
 
     long off = 0;
     while (off < es_size && !eos) {
-        long au = next_au(es, es_size, off + 4);
+        long au = demux_next_au(es, es_size, off + 4);
         long chunk = (au > 0 ? au : es_size) - off;
         VideoPacket_t pkt;
         memset(&pkt, 0, sizeof(pkt));

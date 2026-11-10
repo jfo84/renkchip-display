@@ -47,6 +47,8 @@ All research was done on hardware I own, on my own network.
 | Path | What |
 | --- | --- |
 | `src/bump.c` | On-device lab program: live cast tap → H.264 decode → VPU buffer → win0 scanout, plus VOP MMU and memory-forensics modes |
+| `src/demux.c`, `src/demux.h` | The cast-tap parse path (RTP → TS → PES → H.264 AUs), extracted so it builds and tests on a host |
+| `tests/test_demux.c` | Demuxer tests: synthetic TS/PES/RTP vectors built in C, no captured data |
 | `scripts/` | Host-side C2: arm, re-arm after reboot, remote shell, build |
 | `scripts/ops_dlna.sh` | The TV status driver: render → serve → SOAP-play loop |
 | `scripts/serve_ops.ps1`, `scripts/setup_ops.ps1` | Desktop file server + one-shot setup |
@@ -62,6 +64,11 @@ repo** — pull them from your own device or the vendor SDK, drop them next to
 `bump.c`, then:
 
     NDK_CC=path/to/armv7a-linux-androideabi21-clang ./scripts/build_bump.sh
+
+The demuxer tests need nothing but a C compiler — no vendor headers, no
+hardware. They run on any host:
+
+    ./scripts/run_tests.sh
 
 The scripts reference my lab IPs (stick at `192.168.8.160`, desktop at
 `192.168.8.219`); adjust to your own. `scripts/server2.py` serves the script
