@@ -283,8 +283,154 @@ static int fuzz(long iters, unsigned long long seed)
     return fails ? 1 : 0;
 }
 
+/* ---- golden: feed a captured pcapng through the demux in arrival
+ * order (adjacent duplicate seq dropped — pktmon's etl2pcap writes
+ * every packet twice) and concatenate the AUs. With a reference ES
+ * file (extract_es.py output), compare byte-for-byte and print the
+ * first difference. Two independent implementations agreeing here is
+ * the strongest host-side check there is. ---- */
+static unsigned char *g_es;
+static long long g_aus, g_bytes, g_cap;
+static void golden_au(void *ctx, const unsigned char *au, long len)
+{
+    (void)ctx;
+    if (g_bytes + len > g_cap) {
+        g_cap = (g_bytes + len) * 2 + (1 << 20);
+        g_es = realloc(g_es, g_cap);
+        if (!g_es) exit(2);
+    }
+    memcpy(g_es + g_bytes, au, len);
+    g_aus++; g_bytes += len;
+}
+
+static int seq_of(const unsigned char *pkt, int n)
+{
+    const unsigned char *ip = NULL;
+    if (n > 34 && pkt[12] == 0x08 && pkt[13] == 0x00)
+        ip = pkt + 14;
+    else
+        for (int i = 14; i < 34 && i + 20 <= n; i++)
+            if (pkt[i] == 0x45) { ip = pkt + i; break; }
+    if (!ip || (ip[0] >> 4) != 4 || ip[9] != 17) return -1;
+    const unsigned char *udp = ip + (ip[0] & 0xF) * 4;
+    if (((udp[2] << 8) | udp[3]) != PORT) return -1;
+    const unsigned char *r = udp + 8;
+    if (n - (r - pkt) < 12 || (r[0] >> 6) != 2) return -1;
+    if ((r[1] & 0x7F) != 33) return -1;           /* MP2T, like the ref */
+    return (r[2] << 8) | r[3];
+}
+
+static int golden_run(const char *path, const char *ref)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("FAIL golden: cannot open %s\n", path); return 1; }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = malloc(fsz);
+    if (!buf || fread(buf, 1, fsz, f) != (size_t)fsz) {
+        printf("FAIL golden: read error\n");
+        free(buf); fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    /* Pass 1: collect RTP packets on the watched port, dedup by seq
+     * (pktmon writes each packet several times, NOT adjacently), like
+     * the reference extractor. Then sort by seq and unwrap at the
+     * largest gap, so the demux sees the stream in seq order — the
+     * arrival-vs-sorted difference is a capture artifact, not a parse
+     * behavior, and we are testing the parse. */
+    struct rp { unsigned seq; long off; unsigned len; } *pk =
+        malloc(sizeof(struct rp) * 200000);
+    static unsigned char seen[65536 / 8];
+    long np = 0;
+    for (long off = 0; off + 12 <= fsz; ) {
+        unsigned btype = buf[off] | ((unsigned)buf[off + 1] << 8) |
+                         ((unsigned)buf[off + 2] << 16) | ((unsigned)buf[off + 3] << 24);
+        unsigned blen = buf[off + 4] | ((unsigned)buf[off + 5] << 8) |
+                        ((unsigned)buf[off + 6] << 16) | ((unsigned)buf[off + 7] << 24);
+        if (btype == 0x0A0D0D0A || btype == 0x0D0D0A0A) { off += blen; continue; }
+        if (blen < 12 || off + blen > fsz) break;
+        if (btype == 6) {                          /* Enhanced Packet Block */
+            unsigned caplen = buf[off + 20] | ((unsigned)buf[off + 21] << 8) |
+                              ((unsigned)buf[off + 22] << 16) | ((unsigned)buf[off + 23] << 24);
+            if (off + 28 + caplen <= fsz && np < 200000) {
+                int seq = seq_of(buf + off + 28, (int)caplen);
+                if (seq >= 0 && !(seen[seq >> 3] & (1 << (seq & 7)))) {
+                    seen[seq >> 3] |= 1 << (seq & 7);
+                    pk[np].seq = (unsigned)seq;
+                    pk[np].off = off + 28;
+                    pk[np].len = caplen;
+                    np++;
+                }
+            }
+        }
+        off += blen;
+    }
+    for (long i = 0; i < np; i++)                  /* index sort by seq */
+        for (long j = i + 1; j < np; j++)
+            if (pk[j].seq < pk[i].seq) {
+                struct rp t = pk[i]; pk[i] = pk[j]; pk[j] = t;
+            }
+    long start = 0;                                /* unwrap at the wrap */
+    if (np > 1 && pk[0].seq > pk[np - 1].seq) {
+        unsigned maxseq = 0;
+        for (long i = 0; i < np; i++)
+            if (pk[i].seq >= maxseq) { maxseq = pk[i].seq; start = i + 1; }
+    }
+    printf("golden: %ld unique RTP packets (deduped, seq-sorted)\n", np);
+
+    /* Pass 2: feed in seq order */
+    demux_reset();
+    g_aus = g_bytes = g_cap = 0;
+    free(g_es);
+    g_es = NULL;
+    for (long i = 0; i < np; i++) {
+        struct rp *p = &pk[(start + i) % np];
+        demux_frame(&d, buf + p->off, (int)p->len, PORT, golden_au, NULL);
+    }
+    demux_eos(&d, golden_au, NULL);
+    printf("golden: aus=%lld bytes=%lld\n", g_aus, g_bytes);
+    free(pk);
+    free(buf);
+    if (!ref) return 0;
+
+    FILE *rf = fopen(ref, "rb");
+    if (!rf) { printf("FAIL golden: cannot open reference %s\n", ref); return 1; }
+    fseek(rf, 0, SEEK_END);
+    long rsz = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    unsigned char *rbuf = malloc(rsz);
+    if (!rbuf || fread(rbuf, 1, rsz, rf) != (size_t)rsz) {
+        printf("FAIL golden: reference read error\n");
+        free(rbuf); fclose(rf);
+        return 1;
+    }
+    fclose(rf);
+    long n = g_bytes < rsz ? g_bytes : rsz;
+    long diff = -1;
+    for (long i = 0; i < n; i++)
+        if (g_es[i] != rbuf[i]) { diff = i; break; }
+    if (diff < 0 && g_bytes == rsz) {
+        printf("ok   golden: %ld bytes identical to the reference ES\n", rsz);
+        free(rbuf);
+        return 0;
+    }
+    if (diff < 0) diff = n;
+    printf("FAIL golden: first diff at byte %ld (demux %lld B, reference %ld B)\n",
+           diff, g_bytes, rsz);
+    printf("     demux: %02x %02x %02x %02x  ref: %02x %02x %02x %02x\n",
+           g_es[diff], g_es[diff + 1], g_es[diff + 2], g_es[diff + 3],
+           rbuf[diff], rbuf[diff + 1], rbuf[diff + 2], rbuf[diff + 3]);
+    free(rbuf);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && strcmp(argv[1], "--golden") == 0)
+        return golden_run(argv[2], argc > 3 ? argv[3] : NULL);
     au_init(au_a, 0xAA);
     au_init(au_b, 0xBB);
     au_init(au_c, 0xCC);

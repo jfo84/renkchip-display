@@ -162,3 +162,9 @@ long demux_flush(struct demux *d, au_cb cb, void *ctx)
     d->au_cnt++;
     return pend;
 }
+
+void demux_eos(struct demux *d, au_cb cb, void *ctx)
+{
+    pes_close(d, cb, ctx);          /* a final PUSI that never comes */
+    demux_flush(d, cb, ctx);        /* then the sparse-stream tail */
+}

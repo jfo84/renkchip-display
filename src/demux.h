@@ -39,6 +39,11 @@ int demux_frame(struct demux *d, const unsigned char *frame, int n,
  * Returns flushed bytes (0 if the window was empty). */
 long demux_flush(struct demux *d, au_cb cb, void *ctx);
 
+/* End of stream: close the pending PES the way a final PUSI would,
+ * feed every complete AU, then flush the remainder. A live stream
+ * never ends, so the tap never needs this; file/golden replay does. */
+void demux_eos(struct demux *d, au_cb cb, void *ctx);
+
 /* Offset of the next picture start code (NAL type 1 or 5) at/after
  * `from`, -1 if none. Shared with bump's file-decode mode. */
 long demux_next_au(const unsigned char *p, long size, long from);
