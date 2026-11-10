@@ -43,10 +43,18 @@ rebuilds busybox applet symlinks and bind-mounts my replacement wfd daemon
   all cache operations are no-ops. The `phy_addr` / `FrameBusAddr` fields in
   the legacy structs are garbage (tiny fd-like numbers). `vir_addr` is the
   only truth; real physical addresses come from `/proc/self/pagemap`.
-- Open bug: sometimes `decode_getframe` returns pool buffers with no pixel
-  data at all (flat, unwritten; metadata fine, err=0) — seen both on a wedged
-  session and on a fresh boot, while the same binary produced real pixels in
-  other runs. Under investigation.
+- **Pagemap can lie too** (Nov 6): on some boots the PFNs come back garbage
+  — writes land in phantom regions and the panel shows the green screen (the
+  VOP scanning zeros). Re-resolve with a fresh `fopen` of pagemap per page
+  (the long-lived-fd read path goes bad under the shim); when that fails
+  too, plant a 16-byte cookie through the cached pointer (buffer > L2, so it
+  lands in DRAM) and hunt it in `/dev/mem` — **CMA only** (8 MiB at
+  `0x67800000` on my unit). Scanning all of DRAM maps reserved/hole regions
+  and panics this kernel. That resolver is `find_buf_phys()` in bump.c.
+- The "empty frames" mystery, closed: `decode_getframe` returns flat,
+  unwritten pool buffers until the first reference-complete output (~frame
+  16–29, mid-GOP — a joiner can't render until its references exist).
+  IDR-led live casts never show it. Warm-up behavior, not a bug.
 
 ## Display — the win0 path
 
@@ -77,14 +85,20 @@ the panel: Y=0xFF / UV=0x00 renders as a saturated green test pattern.
 The register-file readback lies — the driver repaints it with boot values.
 Trust the panel, not the readback.
 
-**Open:** the pattern renders with periodic red squares = VOP fetch faults.
-The VOP has an IOMMU (registers at VOP+0x300…0x324, `DTE_ADDR=0x67153000`,
-active at boot) that doesn't know about my buffer. Next step: map the buffer
-into its page table or disable paging.
+After a vendor cast, win1 can stay latched — green bars over our win0. Clear
+WIN1_EN (bit 1 of `SYS_CTRL`) when taking the display; the code does.
 
-SurfaceFlinger must be stopped while writing VOP registers — with SF running,
-register pokes watchdog-reboot the box ~10 minutes later; with SF stopped, no
-reboot observed.
+**Red squares, resolved (Nov 6):** they were VOP IOMMU fetch faults. The VOP
+has an MMU (registers at VOP+0x300…0x324, `DTE_ADDR=0x67153000`, active at
+boot) that doesn't know about my buffer. Clearing **m_MMU_EN (bit 10 of the
+AXI register, VOP+0x2C)** puts the VOP into bypass — clean fetches, squares
+gone. Caveat: SurfaceFlinger's buffers only make sense translated, so hand
+translation back (`mmuon`) before vendor content runs. `mmuoff` / `mmuon` /
+`mmuclr` are first-class modes now.
+
+Watchdog: VOP register writes trip the ~10-minute watchdog **even with
+SurfaceFlinger stopped** (the earlier "no reboot with SF stopped" didn't
+survive longer sessions). Plan raw-display sessions short.
 
 ## Box quirks
 
@@ -101,8 +115,16 @@ reboot observed.
 
 ## Where this goes next
 
-1. VOP IOMMU: map my pages or disable paging → kills the red squares.
-2. The empty-frames decoder bug.
-3. Live path: pre-bind the RTP port, receive a real cast, decode into win0.
+1. ~~VOP IOMMU~~ — done via bypass (`mmuoff`); page-table mapping is the
+   nicer long-term answer if vendor content must coexist with ours.
+2. ~~Empty-frames decoder bug~~ — understood; decoder warm-up, see above.
+3. ~~Live path~~ — done: `bump x live` taps the cast's RTP with AF_PACKET
+   (a bound port breaks the sink's session setup — tap, don't bind),
+   demuxes TS→PES→H.264, decodes, scans out on win0 with the MMU bypassed.
+   300+ frames of a live 720p cast through the full own pipeline. The stall
+   that hid it: a static screen may never produce an access unit, so pending
+   input must be time-flushed to the decoder.
 4. 1080p via CEA masks in the WFD negotiation + a 256-byte EDID
    (`tools/edid_builder.py` builds the 128-byte variant).
+5. Boot-to-boot pagemap garbage — why PFNs come back bogus on some boots
+   (the green screen). `find_buf_phys` works around it; the cause is open.
