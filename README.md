@@ -2,15 +2,25 @@
 
 **Turning a cheap Renkchip Q2 Miracast stick into a tiny display node.**
 
-The goal: an ordinary TV hanging on the wall showing a quiet status page at
-1080p, driven by a $20 stick, with no vendor cast stack in the way.
+The goal: an ordinary TV hanging on the wall showing a quiet status page,
+driven by a $20 stick. As of Nov 2026 the TV shows the page — through the
+stick's stock DLNA renderer, in a self-healing loop — and the "no vendor
+stack in the way" version is proven too: a live cast tapped off the air,
+decoded on the VPU, scanned out by the display controller directly.
 
 ## What this is
 
 Original code and research findings from liberating a **Renkchip Q2 Miracast
-HDMI stick** (Rockchip RK3036, Android 5.1) that I own. The end-to-end goal:
-receive an H.264 stream, decode it on the stick's VPU, and drive the panel
-directly through the display controller — my own receive path, end to end.
+HDMI stick** (Rockchip RK3036, Android 5.1) that I own. Two tracks:
+
+- **The practical display node** — render the page on a real computer,
+  serve it from the LAN, and let the stick's stock DLNA player show it at
+  1080p, forever. `scripts/ops_dlna.sh` + the desktop server; the
+  constraints live in `docs/DLNA-STATUS-PIPELINE.md`.
+- **The own receive path** — no vendor player in the loop: tap a live
+  cast's RTP with AF_PACKET, demux to H.264, decode through the VPU,
+  program win0 to scan my buffer out directly. `src/bump.c`; the
+  reverse-engineering story is `docs/FINDINGS.md`.
 
 All research was done on hardware I own, on my own network.
 
@@ -29,14 +39,14 @@ All research was done on hardware I own, on my own network.
 - **Full live path proven (Nov 6)**: a real cast's RTP tapped off the air
   (AF_PACKET), demuxed to H.264, decoded, scanned out on win0 — 300+ frames
   of live 720p through the whole own pipeline (`bump x live`).
-- Open: 1080p via EDID/CEA negotiation; the boot-to-boot pagemap garbage
-  behind the green screen (see `docs/FINDINGS.md`).
+- Open: 1080p on the own path via EDID/CEA negotiation; the boot-to-boot
+  pagemap garbage behind the green screen (see `docs/FINDINGS.md`).
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `src/bump.c` | On-device lab program: H.264 decode → VPU buffer → win0 scanout |
+| `src/bump.c` | On-device lab program: live cast tap → H.264 decode → VPU buffer → win0 scanout, plus VOP MMU and memory-forensics modes |
 | `scripts/` | Host-side C2: arm, re-arm after reboot, remote shell, build |
 | `scripts/ops_dlna.sh` | The TV status driver: render → serve → SOAP-play loop |
 | `scripts/serve_ops.ps1`, `scripts/setup_ops.ps1` | Desktop file server + one-shot setup |
