@@ -3,8 +3,12 @@
  * PES packets, RTP/IP/Ethernet framing. Feed frames, assert the AUs
  * that come back. Build & run:
  *   clang -Wall -Wextra -O2 -o test_demux test_demux.c demux.c && ./test_demux
+ * Mutation fuzz pass (deterministic; worth rebuilding with
+ * -fsanitize=address,undefined for the real value):
+ *   ./test_demux --fuzz 100000
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "demux.h"
 
@@ -34,6 +38,7 @@ static void rec_reset(void) { rec_n = 0; au_count = 0; }
 
 /* ---- synthetic AU payloads: NAL 5 start code + filler ---- */
 #define AU_FILL 40
+#define AU_LEN  (4 + AU_FILL)
 static unsigned char au_a[3 + 1 + AU_FILL], au_b[3 + 1 + AU_FILL],
     au_c[3 + 1 + AU_FILL];
 static void au_init(unsigned char *au, unsigned char fill)
@@ -174,8 +179,258 @@ static void feed_pes(const unsigned char *payload, int plen, int pusi,
     demux_frame(&d, frame, fl, PORT, rec_au, NULL);
 }
 
-int main(void)
+/* ---- mutation fuzzer: a corpus of valid frames, random mutations
+ * (bit flips, byte smashes, truncation, splices, garbage tails), and
+ * state/bounds invariants asserted after every fed frame. Deterministic
+ * for a given seed; the real value is running it under ASan/UBSan. ---- */
+static unsigned long long xs;
+static unsigned rnd(void)
 {
+    xs ^= xs << 13; xs ^= xs >> 7; xs ^= xs << 17;
+    return (unsigned)(xs >> 11);
+}
+static unsigned long long fuzz_bytes_out;
+static void fuzz_au(void *ctx, const unsigned char *au, long len)
+{
+    (void)ctx; (void)au;
+    if (len <= 0 || len > DEMUX_ES_CAP) {
+        printf("FAIL fuzz: AU length %ld out of bounds\n", len);
+        fails++;
+    }
+    fuzz_bytes_out += len;
+}
+static int corpus_n;
+static unsigned char corpus[8][512];
+static int corpus_len[8];
+static void corpus_init(void)
+{
+    int i = 0;
+    mk_pat(sec);                                    /* 0: PAT + PMT */
+    int n = ts_section(ts, 0, sec, 21);
+    mk_pmt(sec);
+    n += ts_section(ts + n, PMT_PID, sec, 22);
+    corpus_len[i] = mk_frame(corpus[i], ts, n, 100, PORT, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,        /* 1-3: PES A/B/C */
+        ts_pes(ts, pes, mk_pes(pes, au_a, AU_LEN), 1), 101, PORT, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,
+        ts_pes(ts, pes, mk_pes(pes, au_b, AU_LEN), 1), 102, PORT, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,
+        ts_pes(ts, pes, mk_pes(pes, au_c, AU_LEN), 1), 103, PORT, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,        /* 4: raw continuation */
+        ts_pes(ts, au_b, 12, 0), 104, PORT, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,        /* 5: wrong port */
+        ts_pes(ts, pes, mk_pes(pes, au_a, AU_LEN), 1), 105, PORT + 1, 1), i++;
+    corpus_len[i] = mk_frame(corpus[i], ts,        /* 6: RTP version 1 */
+        ts_pes(ts, pes, mk_pes(pes, au_a, AU_LEN), 1), 106, PORT, 0), i++;
+    corpus_n = i;
+}
+static int fuzz(long iters, unsigned long long seed)
+{
+    xs = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    corpus_init();
+    demux_reset();
+    int f0 = fails;
+    unsigned char buf[2048];
+    for (long it = 1; it <= iters; it++) {
+        int c = rnd() % corpus_n;
+        int len = corpus_len[c];
+        memcpy(buf, corpus[c], len);
+        for (int m = rnd() % 9; m > 0; m--) {       /* 0..8 mutations */
+            switch (rnd() % 5) {
+            case 0:                                 /* bit flip */
+                buf[rnd() % len] ^= 1u << (rnd() % 8);
+                break;
+            case 1:                                 /* byte smash */
+                buf[rnd() % len] = (unsigned char)rnd();
+                break;
+            case 2:                                 /* truncate */
+                len = 1 + (int)(rnd() % (unsigned)len);
+                break;
+            case 3: {                               /* splice corpus bytes */
+                int at = rnd() % len, take = 1 + rnd() % 64;
+                if (at + take > len) take = len - at;
+                if (take > 0)
+                    memcpy(buf + at, corpus[rnd() % corpus_n], take);
+                break;
+            }
+            case 4:                                 /* garbage tail */
+                if (len < (int)sizeof buf) {
+                    int add = 1 + rnd() % 128;
+                    if (len + add > (int)sizeof buf)
+                        add = (int)sizeof buf - len;
+                    for (int k = 0; k < add; k++)
+                        buf[len + k] = (unsigned char)rnd();
+                    len += add;
+                }
+                break;
+            }
+        }
+        (void)demux_frame(&d, buf, len, PORT, fuzz_au, NULL);
+        if (d.esr > d.esw || d.esw > DEMUX_ES_CAP ||
+            d.peslen > DEMUX_PES_CAP) {
+            printf("FAIL fuzz iter %ld: esr=%u esw=%u peslen=%u\n",
+                   it, d.esr, d.esw, d.peslen);
+            fails++;
+            break;
+        }
+        if ((it & 1023) == 0) demux_reset();
+    }
+    printf(f0 == fails
+               ? "ok   fuzz: %ld iterations, invariants held "
+                 "(%llu AU bytes out)\n"
+               : "FAIL fuzz after %ld iterations\n",
+           iters, fuzz_bytes_out);
+    return fails ? 1 : 0;
+}
+
+/* ---- golden: feed a captured pcapng through the demux in arrival
+ * order (adjacent duplicate seq dropped — pktmon's etl2pcap writes
+ * every packet twice) and concatenate the AUs. With a reference ES
+ * file (extract_es.py output), compare byte-for-byte and print the
+ * first difference. Two independent implementations agreeing here is
+ * the strongest host-side check there is. ---- */
+static unsigned char *g_es;
+static long long g_aus, g_bytes, g_cap;
+static void golden_au(void *ctx, const unsigned char *au, long len)
+{
+    (void)ctx;
+    if (g_bytes + len > g_cap) {
+        g_cap = (g_bytes + len) * 2 + (1 << 20);
+        g_es = realloc(g_es, g_cap);
+        if (!g_es) exit(2);
+    }
+    memcpy(g_es + g_bytes, au, len);
+    g_aus++; g_bytes += len;
+}
+
+static int seq_of(const unsigned char *pkt, int n)
+{
+    const unsigned char *ip = NULL;
+    if (n > 34 && pkt[12] == 0x08 && pkt[13] == 0x00)
+        ip = pkt + 14;
+    else
+        for (int i = 14; i < 34 && i + 20 <= n; i++)
+            if (pkt[i] == 0x45) { ip = pkt + i; break; }
+    if (!ip || (ip[0] >> 4) != 4 || ip[9] != 17) return -1;
+    const unsigned char *udp = ip + (ip[0] & 0xF) * 4;
+    if (((udp[2] << 8) | udp[3]) != PORT) return -1;
+    const unsigned char *r = udp + 8;
+    if (n - (r - pkt) < 12 || (r[0] >> 6) != 2) return -1;
+    if ((r[1] & 0x7F) != 33) return -1;           /* MP2T, like the ref */
+    return (r[2] << 8) | r[3];
+}
+
+static int golden_run(const char *path, const char *ref)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("FAIL golden: cannot open %s\n", path); return 1; }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *buf = malloc(fsz);
+    if (!buf || fread(buf, 1, fsz, f) != (size_t)fsz) {
+        printf("FAIL golden: read error\n");
+        free(buf); fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    /* Pass 1: collect RTP packets on the watched port, dedup by seq
+     * (pktmon writes each packet several times, NOT adjacently), like
+     * the reference extractor. Then sort by seq and unwrap at the
+     * largest gap, so the demux sees the stream in seq order — the
+     * arrival-vs-sorted difference is a capture artifact, not a parse
+     * behavior, and we are testing the parse. */
+    struct rp { unsigned seq; long off; unsigned len; } *pk =
+        malloc(sizeof(struct rp) * 200000);
+    static unsigned char seen[65536 / 8];
+    long np = 0;
+    for (long off = 0; off + 12 <= fsz; ) {
+        unsigned btype = buf[off] | ((unsigned)buf[off + 1] << 8) |
+                         ((unsigned)buf[off + 2] << 16) | ((unsigned)buf[off + 3] << 24);
+        unsigned blen = buf[off + 4] | ((unsigned)buf[off + 5] << 8) |
+                        ((unsigned)buf[off + 6] << 16) | ((unsigned)buf[off + 7] << 24);
+        if (btype == 0x0A0D0D0A || btype == 0x0D0D0A0A) { off += blen; continue; }
+        if (blen < 12 || off + blen > fsz) break;
+        if (btype == 6) {                          /* Enhanced Packet Block */
+            unsigned caplen = buf[off + 20] | ((unsigned)buf[off + 21] << 8) |
+                              ((unsigned)buf[off + 22] << 16) | ((unsigned)buf[off + 23] << 24);
+            if (off + 28 + caplen <= fsz && np < 200000) {
+                int seq = seq_of(buf + off + 28, (int)caplen);
+                if (seq >= 0 && !(seen[seq >> 3] & (1 << (seq & 7)))) {
+                    seen[seq >> 3] |= 1 << (seq & 7);
+                    pk[np].seq = (unsigned)seq;
+                    pk[np].off = off + 28;
+                    pk[np].len = caplen;
+                    np++;
+                }
+            }
+        }
+        off += blen;
+    }
+    for (long i = 0; i < np; i++)                  /* index sort by seq */
+        for (long j = i + 1; j < np; j++)
+            if (pk[j].seq < pk[i].seq) {
+                struct rp t = pk[i]; pk[i] = pk[j]; pk[j] = t;
+            }
+    long start = 0;                                /* unwrap at the wrap */
+    if (np > 1 && pk[0].seq > pk[np - 1].seq) {
+        unsigned maxseq = 0;
+        for (long i = 0; i < np; i++)
+            if (pk[i].seq >= maxseq) { maxseq = pk[i].seq; start = i + 1; }
+    }
+    printf("golden: %ld unique RTP packets (deduped, seq-sorted)\n", np);
+
+    /* Pass 2: feed in seq order */
+    demux_reset();
+    g_aus = g_bytes = g_cap = 0;
+    free(g_es);
+    g_es = NULL;
+    for (long i = 0; i < np; i++) {
+        struct rp *p = &pk[(start + i) % np];
+        demux_frame(&d, buf + p->off, (int)p->len, PORT, golden_au, NULL);
+    }
+    demux_eos(&d, golden_au, NULL);
+    printf("golden: aus=%lld bytes=%lld\n", g_aus, g_bytes);
+    free(pk);
+    free(buf);
+    if (!ref) return 0;
+
+    FILE *rf = fopen(ref, "rb");
+    if (!rf) { printf("FAIL golden: cannot open reference %s\n", ref); return 1; }
+    fseek(rf, 0, SEEK_END);
+    long rsz = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    unsigned char *rbuf = malloc(rsz);
+    if (!rbuf || fread(rbuf, 1, rsz, rf) != (size_t)rsz) {
+        printf("FAIL golden: reference read error\n");
+        free(rbuf); fclose(rf);
+        return 1;
+    }
+    fclose(rf);
+    long n = g_bytes < rsz ? g_bytes : rsz;
+    long diff = -1;
+    for (long i = 0; i < n; i++)
+        if (g_es[i] != rbuf[i]) { diff = i; break; }
+    if (diff < 0 && g_bytes == rsz) {
+        printf("ok   golden: %ld bytes identical to the reference ES\n", rsz);
+        free(rbuf);
+        return 0;
+    }
+    if (diff < 0) diff = n;
+    printf("FAIL golden: first diff at byte %ld (demux %lld B, reference %ld B)\n",
+           diff, g_bytes, rsz);
+    printf("     demux: %02x %02x %02x %02x  ref: %02x %02x %02x %02x\n",
+           g_es[diff], g_es[diff + 1], g_es[diff + 2], g_es[diff + 3],
+           rbuf[diff], rbuf[diff + 1], rbuf[diff + 2], rbuf[diff + 3]);
+    free(rbuf);
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 2 && strcmp(argv[1], "--golden") == 0)
+        return golden_run(argv[2], argc > 3 ? argv[3] : NULL);
     au_init(au_a, 0xAA);
     au_init(au_b, 0xBB);
     au_init(au_c, 0xCC);
@@ -268,13 +523,14 @@ int main(void)
     demux_reset();
     feed_pat_pmt(600);
     {
-        unsigned char mix[188 * 3];
+        unsigned char mix[188 * 3 + 100];
         int n = 0;
         n += ts_pes(mix + n, pes, mk_pes(pes, au_a, aulen), 1);
         mix[n] = 0x00;                               /* bad sync */
         n += 188;
         n += ts_pes(mix + n, pes, mk_pes(pes, au_b, aulen), 1);
-        int fl3 = mk_frame(frame, mix, n + 100, 601, PORT, 1); /* +trunc */
+        memset(mix + n, 0, 100);                      /* truncated tail */
+        int fl3 = mk_frame(frame, mix, n + 100, 601, PORT, 1);
         (void)demux_frame(&d, frame, fl3, PORT, rec_au, NULL);
         CHECK(au_count == 0, "corrupt sync byte: packet lost, PES intact");
         feed_pes(au_c, aulen, 1, 602);
@@ -308,6 +564,112 @@ int main(void)
         CHECK(d.in_pes == 1, "parser takes the next PES after the drop");
     }
 
+    /* 9. RTP extension header: the X-bit branch must skip profile+words
+     *    and still land the payload at the parsed offset */
+    demux_reset();
+    feed_pat_pmt(500);
+    {
+        int n = ts_pes(ts, pes, mk_pes(pes, au_a, aulen), 1);
+        int fl5 = mk_frame(frame, ts, n, 501, PORT, 1);
+        unsigned char *r = frame + 42;              /* RTP header */
+        memmove(r + 20, r + 12, n);                 /* payload moves past ext */
+        r[0] = 0x90;                                /* v2 + X bit */
+        r[12] = 0xBE; r[13] = 0xDE;                 /* extension profile */
+        r[14] = 0x00; r[15] = 0x01;                 /* 1 extension word */
+        memset(r + 16, 0x5A, 4);
+        CHECK(demux_frame(&d, frame, fl5 + 8, PORT, rec_au, NULL) == 1,
+              "RTP extension header is consumed");
+        feed_pes(au_b, aulen, 1, 502);              /* PUSI closes the ext PES */
+        CHECK(d.pes_cnt == 1, "PES arrived through the extension header");
+        CHECK(demux_flush(&d, rec_au, NULL) == aulen &&
+              memcmp(rec, au_a, aulen) == 0,
+              "AU intact behind an RTP extension header");
+    }
+
+    /* 10. PTS-bearing PES header — the real wire shape (hdrlen 5), so
+     *     the off = 9 + header_length strip is exercised realistically */
+    demux_reset();
+    feed_pat_pmt(600);
+    {
+        unsigned char p[64];
+        p[0] = 0; p[1] = 0; p[2] = 1; p[3] = 0xE0;
+        p[4] = 0; p[5] = 0;                         /* PES_length: 0 */
+        p[6] = 0x80; p[7] = 0x00;                   /* PTS flag set */
+        p[8] = 5;                                   /* header_data_length */
+        p[9] = 0x21; p[10] = 0x00; p[11] = 0x01;    /* 5 PTS bytes */
+        p[12] = 0x00; p[13] = 0x01;
+        memcpy(p + 14, au_b, aulen);
+        int fl6 = mk_frame(frame, ts, ts_pes(ts, p, 14 + aulen, 1),
+                           601, PORT, 1);
+        (void)demux_frame(&d, frame, fl6, PORT, rec_au, NULL);
+        feed_pes(au_c, aulen, 1, 602);              /* closes the PTS PES */
+        CHECK(demux_flush(&d, rec_au, NULL) == aulen &&
+              memcmp(rec, au_b, aulen) == 0,
+              "PTS-bearing PES header stripped by header length");
+    }
+
+    /* 11. SPS/PPS do not cut: AUs split only at picture NALs (1/5), so
+     *     a [SPS][PPS][IDR] prefix becomes its own decoder chunk */
+    demux_reset();
+    feed_pat_pmt(700);
+    {
+        static const unsigned char sps[6] = {0, 0, 1, 7, 0x11, 0x22};
+        static const unsigned char pps[6] = {0, 0, 1, 8, 0x33, 0x44};
+        unsigned char pre[6 + 6 + 4 + AU_FILL];
+        memcpy(pre, sps, 6);
+        memcpy(pre + 6, pps, 6);
+        memcpy(pre + 12, au_a, aulen);
+        feed_pes(pre, sizeof pre, 1, 701);
+        feed_pes(au_b, aulen, 1, 702);              /* closes: SPS+PPS+IDR_A */
+        CHECK(au_count == 1 && rec_n == 12 &&
+              memcmp(rec, sps, 6) == 0 && memcmp(rec + 6, pps, 6) == 0,
+              "SPS/PPS form their own chunk; cut only at picture NALs");
+    }
+
+    /* 12. ES-window saturation: codeless appends fill the window, the
+     *     compaction memmove runs (esr resets to 0), and the window
+     *     stays bounded no matter how much garbage arrives */
+    demux_reset();
+    feed_pat_pmt(800);
+    {
+        feed_pes(au_a, aulen, 1, 801);
+        feed_pes(au_b, aulen, 1, 802);              /* closes: [A] pending */
+        feed_pes(au_c, aulen, 1, 803);              /* closes: [A][B] → A cut */
+        CHECK(d.esr == aulen && au_count == 1, "AU cut; window tail pending");
+        /* fat filler frames: one PES-start TS + 46 raw continuations,
+         * 47 TS = 8836 B of code-free ES per close (filling 4 MB a
+         * window-scan at a time would be quadratic with thin frames) */
+        static unsigned char bigts[188 * 47], bigf[9000];
+        int bn = ts_pes(bigts, pes, mk_pes(pes, au_c + 4, AU_FILL), 1);
+        while (bn < (int)sizeof bigts)
+            bn += ts_payload(bigts + bn, VPID, 0, au_c + 4, AU_FILL);
+        unsigned plateau = 0, last = d.esw;
+        for (int i = 0; i < 6000 && plateau < 8; i++) {
+            int fl7 = mk_frame(bigf, bigts, (int)sizeof bigts,
+                               804 + i, PORT, 1);
+            (void)demux_frame(&d, bigf, fl7, PORT, rec_au, NULL);
+            plateau = (d.esw == last) ? plateau + 1 : 0;
+            last = d.esw;
+        }
+        CHECK(plateau >= 8, "window saturates (compaction regime reached)");
+        CHECK(d.esr == 0, "compaction consumed the read cursor");
+        CHECK(d.esw <= DEMUX_ES_CAP && d.esr <= d.esw,
+              "window stays bounded under overfill");
+    }
+
+    /* 13. RTP seq loss across the 16-bit wrap */
+    demux_reset();
+    {
+        int tn = ts_pes(ts, pes, 0, 0);             /* bare TS payload */
+        int f1 = mk_frame(frame, ts, tn, 65534, PORT, 1);
+        (void)demux_frame(&d, frame, f1, PORT, rec_au, NULL);
+        int f2 = mk_frame(frame, ts, tn, 1, PORT, 1);   /* 65535, 0 lost */
+        (void)demux_frame(&d, frame, f2, PORT, rec_au, NULL);
+        CHECK(d.rtp_lost == 2, "seq loss counted across the wrap");
+    }
+
     printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
+    if (!fails && argc > 1 && strcmp(argv[1], "--fuzz") == 0)
+        return fuzz(argc > 2 ? strtol(argv[2], NULL, 0) : 100000, 0);
     return fails ? 1 : 0;
 }
