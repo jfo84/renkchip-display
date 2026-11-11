@@ -69,14 +69,15 @@ static void ts_packet(struct demux *d, const unsigned char *t, au_cb cb,
         return;
     }
     if (d->pmt_pid > 0 && pid == d->pmt_pid && pusi && d->vpid < 0) {
+        const unsigned char *end = pl + pll;     /* = t + 188 */
         const unsigned char *sec = pl + 1 + pl[0];
-        if (pll <= 16) return;
+        if (sec + 12 > end) return;              /* pointer_field ran past */
         int slen = ((sec[1] & 0xF) << 8) | sec[2];
         int pilen = ((sec[10] & 0xF) << 8) | sec[11];
         int pp = 12 + pilen, apid = -1;
-        int lim = 3 + slen - 4;
-        if (lim > pll) lim = pll;
-        while (pp + 5 <= lim) {
+        const unsigned char *lim = sec + 3 + slen - 4;
+        if (lim > end) lim = end;                /* clamp inside the packet */
+        while (sec + pp + 5 <= lim) {
             int st = sec[pp];
             int ep = ((sec[pp + 1] & 0x1F) << 8) | sec[pp + 2];
             int el = ((sec[pp + 3] & 0xF) << 8) | sec[pp + 4];
@@ -119,6 +120,7 @@ int demux_frame(struct demux *d, const unsigned char *frame, int n,
     }
     if (!ip || (ip[0] >> 4) != 4 || ip[9] != 17) return 0;
     int ihl = (ip[0] & 0xF) * 4;
+    if (ihl < 20 || ip + ihl + 8 > frame + n) return 0;
     const unsigned char *udp = ip + ihl;
     int dport = (udp[2] << 8) | udp[3];
     if (dport != port) return 0;

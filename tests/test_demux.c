@@ -671,5 +671,20 @@ int main(int argc, char **argv)
     printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
     if (!fails && argc > 1 && strcmp(argv[1], "--fuzz") == 0)
         return fuzz(argc > 2 ? strtol(argv[2], NULL, 0) : 100000, 0);
+    /* dump the fuzz corpus as seed files for a coverage-guided fuzzer
+     * (tests/lfuzz.c / libFuzzer); the dir must already exist */
+    if (!fails && argc > 1 && strcmp(argv[1], "--seeds") == 0) {
+        corpus_init();
+        const char *dir = argc > 2 ? argv[2] : "seeds";
+        for (int i = 0; i < corpus_n; i++) {
+            char p[256];
+            snprintf(p, sizeof p, "%s/seed%d", dir, i);
+            FILE *f = fopen(p, "wb");
+            if (!f) { printf("cannot write %s\n", p); return 1; }
+            fwrite(corpus[i], 1, (size_t)corpus_len[i], f);
+            fclose(f);
+        }
+        printf("wrote %d seeds to %s/\n", corpus_n, dir);
+    }
     return fails ? 1 : 0;
 }
