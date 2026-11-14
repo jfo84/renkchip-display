@@ -81,6 +81,21 @@ static int ts_pes(unsigned char *t, const unsigned char *pes, int plen,
 {
     return ts_payload(t, VPID, pusi, pes, plen);
 }
+/* raw section packet, payload-only afc, explicit pointer_field — for
+ * section-edge vectors the wire-shape builder above can't express */
+static int ts_section_raw(unsigned char *t, int pid, const unsigned char *sec0,
+                          int slen, int pf)
+{
+    memset(t, 0xFF, 188);
+    t[0] = 0x47;
+    t[1] = 0x40 | ((pid >> 8) & 0x1F);
+    t[2] = pid & 0xFF;
+    t[3] = 0x10;                                 /* payload only */
+    t[4] = (unsigned char)pf;                    /* pointer_field */
+    if (5 + pf + slen <= 188)
+        memcpy(t + 5 + pf, sec0, slen);
+    return 188;
+}
 /* PES header (9B: start code, stream id video, PESlen=0, flags, hdrlen=0)
  * + up to `plen` payload bytes — the wire shape the parser expects. */
 static int mk_pes(unsigned char *pes, const unsigned char *payload, int plen)
@@ -668,11 +683,174 @@ int main(int argc, char **argv)
         CHECK(d.rtp_lost == 2, "seq loss counted across the wrap");
     }
 
+    /* 14. demux_eos: end of stream closes the pending PES the way a
+     *     final PUSI would, then flushes the window — the golden path
+     *     used it, no synthetic check locked it */
+    demux_reset();
+    feed_pat_pmt(900);
+    {
+        feed_pes(au_a, aulen, 1, 901);           /* PES1: AU_A */
+        feed_pes(au_b, aulen, 1, 902);           /* PUSI closes PES1; PES2 pending */
+        CHECK(d.in_pes == 1 && au_count == 0, "PES pending at end of stream");
+        demux_eos(&d, rec_au, NULL);
+        CHECK(au_count == 2 && rec_n == 2 * aulen &&
+              memcmp(rec, au_a, aulen) == 0 &&
+              memcmp(rec + aulen, au_b, aulen) == 0,
+              "eos closes the PES then flushes: AU_A, AU_B");
+    }
+
+    /* 15. eos on an idle demux is a no-op */
+    demux_reset();
+    demux_eos(&d, rec_au, NULL);
+    CHECK(au_count == 0, "eos on empty state emits nothing");
+
+    /* 16. PMT pointer_field pushed to the packet edge — the exact shape
+     *     of the libFuzzer over-read (sec ran past t+188 pre-fix) */
+    demux_reset();
+    {
+        mk_pat(sec);
+        int n = ts_section(ts, 0, sec, 21);
+        int fl8 = mk_frame(frame, ts, n, 910, PORT, 1);
+        (void)demux_frame(&d, frame, fl8, PORT, rec_au, NULL);
+        CHECK(d.pmt_pid == PMT_PID && d.vpid == -1, "PAT alone arms, no vpid");
+        n = ts_section_raw(ts, PMT_PID, sec, 0, 183);   /* sec == t+188 */
+        fl8 = mk_frame(frame, ts, n, 911, PORT, 1);
+        (void)demux_frame(&d, frame, fl8, PORT, rec_au, NULL);
+        CHECK(d.vpid == -1, "PMT with pf at the edge is ignored, not over-read");
+        n = ts_section_raw(ts, PMT_PID, sec, 0, 200);   /* sec past the packet */
+        fl8 = mk_frame(frame, ts, n, 912, PORT, 1);
+        (void)demux_frame(&d, frame, fl8, PORT, rec_au, NULL);
+        CHECK(d.vpid == -1, "PMT with pf beyond the packet is ignored");
+        mk_pmt(sec);
+        n = ts_section(ts, PMT_PID, sec, 22);           /* good one after */
+        fl8 = mk_frame(frame, ts, n, 913, PORT, 1);
+        (void)demux_frame(&d, frame, fl8, PORT, rec_au, NULL);
+        CHECK(d.vpid == VPID, "a good PMT after the malformed ones still arms");
+    }
+
+    /* 17. PMT section_length overshoot: the loop must clamp at the TS
+     *     packet end (lim guard), not walk slen past the payload */
+    demux_reset();
+    {
+        mk_pat(sec);
+        int n = ts_section(ts, 0, sec, 21);
+        int fl9 = mk_frame(frame, ts, n, 920, PORT, 1);
+        (void)demux_frame(&d, frame, fl9, PORT, rec_au, NULL);
+        mk_pmt(sec);
+        sec[1] = 0xBF; sec[2] = 0xFF;            /* section_length = 4095 */
+        n = ts_section(ts, PMT_PID, sec, 22);
+        fl9 = mk_frame(frame, ts, n, 921, PORT, 1);
+        (void)demux_frame(&d, frame, fl9, PORT, rec_au, NULL);
+        CHECK(d.vpid == VPID && d.apid == APID,
+              "PMT loop clamped at packet end still finds both pids");
+    }
+
+    /* 18. IP header lies: IHL beyond the frame (heap-exact buffer, so
+     *     the pre-fix deref would be an ASan heap over-read) and IHL<5 */
+    demux_reset();
+    {
+        unsigned char *tiny = malloc(42);        /* eth + IP + UDP exactly */
+        memset(tiny, 0, 42);
+        tiny[12] = 0x08; tiny[13] = 0x00;
+        tiny[14] = 0x4F;                         /* IPv4, IHL 15 = 60 B */
+        tiny[14 + 9] = 17;
+        CHECK(demux_frame(&d, tiny, 42, PORT, rec_au, NULL) == 0,
+              "IHL beyond the frame is rejected");
+        tiny[14] = 0x43;                         /* IHL 3 = 12 B */
+        CHECK(demux_frame(&d, tiny, 42, PORT, rec_au, NULL) == 0,
+              "IHL below 20 is rejected");
+        free(tiny);
+        CHECK(d.rtp_cnt == 0, "liar headers count no RTP");
+    }
+
+    /* 19. adaptation-field oddities mid-stream: AF-only (afc=2) and an
+     *     AF that consumes the whole packet (q >= 188) must both be
+     *     skipped without touching the PES under construction */
+    demux_reset();
+    feed_pat_pmt(930);
+    {
+        unsigned char afc2[188], afeof[188];
+        memset(afc2, 0xFF, 188);
+        afc2[0] = 0x47;
+        afc2[1] = (VPID >> 8) & 0x1F; afc2[2] = VPID & 0xFF;
+        afc2[3] = 0x20; afc2[4] = 0x00;          /* AF only, length 0 */
+        memcpy(afeof, afc2, 188);
+        afeof[3] = 0x30; afeof[4] = 183;         /* AF + payload, q = 188 */
+        feed_pes(au_a, aulen, 1, 931);           /* PES1: AU_A */
+        int f1 = mk_frame(frame, afc2, 188, 932, PORT, 1);
+        (void)demux_frame(&d, frame, f1, PORT, rec_au, NULL);
+        int f2 = mk_frame(frame, afeof, 188, 933, PORT, 1);
+        (void)demux_frame(&d, frame, f2, PORT, rec_au, NULL);
+        feed_pes(au_b, aulen, 1, 934);           /* PUSI closes PES1 */
+        CHECK(d.in_pes == 1 && d.peslen == 9 + aulen,
+              "adaptation-only packets leave the pending PES untouched");
+        demux_eos(&d, rec_au, NULL);
+        CHECK(au_count == 2 && memcmp(rec, au_a, aulen) == 0 &&
+              memcmp(rec + aulen, au_b, aulen) == 0,
+              "AUs survive AF oddities in flight");
+    }
+
+    /* 20. audio-pid data must never reach the video window */
+    demux_reset();
+    feed_pat_pmt(940);
+    {
+        int tn = ts_pes(ts, pes, mk_pes(pes, au_a, aulen), 1);
+        ts[1] = (ts[1] & 0xE0) | ((APID >> 8) & 0x1F);   /* retag to APID */
+        ts[2] = APID & 0xFF;
+        int fl10 = mk_frame(frame, ts, tn, 941, PORT, 1);
+        (void)demux_frame(&d, frame, fl10, PORT, rec_au, NULL);
+        CHECK(d.peslen == 0 && d.esw == 0 && au_count == 0,
+              "audio-pid PES never touches the video window");
+    }
+
+    /* 21. duplicate RTP seq (pktmon writes each packet several times):
+     *     the demux itself must count no loss for a repeat */
+    demux_reset();
+    {
+        int tn = ts_pes(ts, pes, 0, 0);
+        int f1 = mk_frame(frame, ts, tn, 501, PORT, 1);
+        (void)demux_frame(&d, frame, f1, PORT, rec_au, NULL);
+        (void)demux_frame(&d, frame, f1, PORT, rec_au, NULL);
+        CHECK(d.rtp_cnt == 2 && d.rtp_lost == 0,
+              "duplicate seq counts no loss");
+    }
+
+    /* 22. header-only PES (9 bytes, no payload): close must skip the
+     *     append and the next PES must still parse whole */
+    demux_reset();
+    feed_pat_pmt(950);
+    {
+        feed_pes(au_b, 0, 1, 951);               /* PES header only */
+        CHECK(d.in_pes == 1 && d.peslen == 9, "header-only PES buffered");
+        feed_pes(au_b, aulen, 1, 952);           /* PUSI closes it */
+        CHECK(d.pes_cnt == 0 && d.in_pes == 1 && d.peslen == 9 + aulen,
+              "header-only close appends nothing; next PES buffered");
+        demux_eos(&d, rec_au, NULL);
+        CHECK(d.pes_cnt == 1 && au_count == 1 &&
+              memcmp(rec, au_b, aulen) == 0,
+              "PES after the empty one parses whole");
+    }
+
+    /* 23. PAT pointer_field guard: oversized pf is rejected, the stream
+     *     can still discover afterwards */
+    demux_reset();
+    {
+        mk_pat(sec);
+        int n = ts_section_raw(ts, 0, sec, 21, 40);      /* pf > 32 */
+        int fl11 = mk_frame(frame, ts, n, 960, PORT, 1);
+        (void)demux_frame(&d, frame, fl11, PORT, rec_au, NULL);
+        CHECK(d.pmt_pid == -1, "PAT with oversized pointer_field ignored");
+        n = ts_section(ts, 0, sec, 21);                  /* good PAT */
+        fl11 = mk_frame(frame, ts, n, 961, PORT, 1);
+        (void)demux_frame(&d, frame, fl11, PORT, rec_au, NULL);
+        CHECK(d.pmt_pid == PMT_PID, "good PAT recovers discovery");
+    }
+
     printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
     if (!fails && argc > 1 && strcmp(argv[1], "--fuzz") == 0)
         return fuzz(argc > 2 ? strtol(argv[2], NULL, 0) : 100000, 0);
     /* dump the fuzz corpus as seed files for a coverage-guided fuzzer
-     * (tests/lfuzz.c / libFuzzer); the dir must already exist */
+     * (lfuzz.c / libFuzzer); the dir must already exist */
     if (!fails && argc > 1 && strcmp(argv[1], "--seeds") == 0) {
         corpus_init();
         const char *dir = argc > 2 ? argv[2] : "seeds";
